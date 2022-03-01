@@ -1,0 +1,40 @@
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 8c6bd3c9eb324..433e689c3c73e 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -3635,6 +3635,27 @@ source_set("simple_quic_tools") {
+   ]
+ }
+ 
++source_set("my_dhcp") {
++  sources = [
++    "third_party/quiche/src/quic/dhcp/dhcp.h",
++    "third_party/quiche/src/quic/dhcp/dhcp-client.h",
++    "third_party/quiche/src/quic/dhcp/dhcp-client.cpp",
++    "third_party/quiche/src/quic/dhcp/dhcp-packet.h",
++    "third_party/quiche/src/quic/dhcp/dhcp-packet.cpp",
++    "third_party/quiche/src/quic/dhcp/lease.h",
++    "third_party/quiche/src/quic/dhcp/lease.cpp",
++  ]
++  deps = [
++    ":net",
++    "//base",
++    "//base/third_party/dynamic_annotations",
++    "//third_party/protobuf:protobuf_lite",
++    "//url",
++  ]
++}
++
++
++
+ if (!is_ios) {
+   executable("quic_client") {
+     sources = [
+@@ -3646,6 +3667,7 @@ if (!is_ios) {
+     deps = [
+       ":net",
+       ":simple_quic_tools",
++      ":my_dhcp",
+       "//base",
+       "//build/win:default_exe_manifest",
+       "//url",

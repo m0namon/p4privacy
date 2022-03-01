@@ -1,0 +1,1714 @@
+diff --git a/quic/dhcp/dhcp-client.cpp b/quic/dhcp/dhcp-client.cpp
+new file mode 100755
+index 00000000..8d2ed593
+--- /dev/null
++++ b/quic/dhcp/dhcp-client.cpp
+@@ -0,0 +1,343 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++//
++// Created by cem on 23.07.2018.
++//
++#include <iostream>
++#include <cstring>
++#include <cstdlib>
++#include <cstdio>
++#include <ctime>
++#include <climits>
++
++#include <unistd.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++
++#include "net/third_party/quiche/src/quic/dhcp/dhcp.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-packet.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-client.h"
++
++#include <net/if.h>
++#include <sys/ioctl.h>
++#include <linux/if_ether.h>
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++
++namespace dhcp {
++  DHCPClient::DHCPClient(const char *interface_name, const char *server_address) {
++    strncpy(ifname_, interface_name, IFNAMSIZ);
++    std::string s(server_address);
++    server_address_ = stringToInAddr(s);
++    struct ifreq ifr = {};
++    memset(&ifr, 0, sizeof(ifreq));
++    strncpy(ifr.ifr_name, ifname_, IFNAMSIZ);
++    int ifreq_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
++    if (ioctl(ifreq_sock, SIOCGIFHWADDR, &ifr) < 0) {
++      std::cout << "Can not gather hwaddr" << std::string(strerror(errno)) << std::endl;
++      // throw DHCPException("Can not gather hwaddr" + std::string(strerror(errno)));
++    }
++    close(ifreq_sock);
++
++    memcpy((void *) &hwaddr_, &ifr.ifr_hwaddr.sa_data, IFHWADDRLEN);
++
++    std::srand((u_int32_t) std::time(nullptr));
++    packet_xid_ = (u_int32_t) random();
++  }
++
++  void DHCPClient::initialize() {
++
++    listen_raw_sock_fd_ = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
++
++    if (listen_raw_sock_fd_ < 0) {
++      std::cout << "Can not create socket for DHCP: " << std::string(strerror(errno)) << std::endl;
++      // throw DHCPException("Can not create socket for DHCP: " + std::string(strerror(errno)));
++    }
++
++    struct timeval timeout = {};
++    timeout.tv_sec = 3;
++    timeout.tv_usec = 0;
++
++    setsockopt(listen_raw_sock_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++
++
++    struct ifreq ifr = {};
++    memset((void *) &ifr, 0, sizeof(struct ifreq));
++    strncpy(ifr.ifr_name, ifname_, IFNAMSIZ);
++    setsockopt(listen_raw_sock_fd_, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr));
++
++    std::srand((u_int32_t) std::time(nullptr));
++    packet_xid_ = (u_int32_t) random();
++
++
++  }
++
++  void DHCPClient::cleanup() {
++    close(listen_raw_sock_fd_);
++  }
++
++  struct dhcp_packet DHCPClient::dhcp_packet_with_headers_set() {
++
++    struct dhcp_packet packet = {};
++
++    // clear the packet data structure
++    bzero(&packet, sizeof(packet));
++
++    // hardware address type
++    packet.htype = HTYPE_ETHER;
++
++    // length of our hardware address
++    packet.hlen = IFHWADDRLEN;
++
++    packet.hops = 0;
++    packet.xid = htonl(packet_xid_);
++    packet.secs = htons(USHRT_MAX);
++    packet.flags = htons(BOOTP_UNICAST);
++
++    memcpy(packet.chaddr, hwaddr_, IFHWADDRLEN);
++    return packet;
++  }
++
++/* sends a DHCPDISCOVER broadcast message in an attempt to find DHCP servers */
++  int DHCPClient::do_discover() {
++    discovery_ = dhcp_packet_with_headers_set();
++
++    int offset = 0;
++    discovery_.options[offset++] = 0x63;
++    discovery_.options[offset++] = 0x82;
++    discovery_.options[offset++] = 0x53;
++    discovery_.options[offset++] = 0x63;
++
++    u_int8_t option;
++
++    discovery_.op = BOOTREQUEST;
++    offset += add_dhcp_option(&discovery_,
++                              DHO_DHCP_MESSAGE_TYPE,
++                              &(option = DHCPDISCOVER),
++                              offset,
++                              sizeof(option)
++    );
++
++    /* the IP address we're requesting */
++    if (request_specific_address_) {
++      offset += add_dhcp_option(&discovery_,
++                                DHO_DHCP_REQUESTED_ADDRESS,
++                                (u_int8_t *) &requested_address_,
++                                offset,
++                                sizeof(requested_address_)
++      );
++    }
++
++    char hostname[1024];
++    hostname[1023] = 0x00;
++    gethostname(hostname, 1023);
++    offset += add_dhcp_option(&discovery_,
++                              DHO_HOST_NAME,
++                              (u_int8_t *) &hostname,
++                              offset,
++                              (u_int8_t) strlen(hostname)
++    );
++
++    u_int8_t parameter_request_list[] = {
++            DHO_SUBNET_MASK,
++            DHO_BROADCAST_ADDRESS,
++            DHO_TIME_OFFSET,
++            DHO_ROUTERS,
++            DHO_DOMAIN_NAME,
++            DHO_DOMAIN_NAME_SERVERS,
++            DHO_HOST_NAME,
++            DHO_NETBIOS_NAME_SERVERS,
++            DHO_INTERFACE_MTU,
++            DHO_STATIC_ROUTES,
++            DHO_NTP_SERVERS,
++            DHO_DHCP_RENEWAL_TIME,
++            DHO_DHCP_REBINDING_TIME
++    };
++
++    offset += add_dhcp_option(&discovery_,
++                              DHO_DHCP_PARAMETER_REQUEST_LIST,
++                              (u_int8_t *) &parameter_request_list,
++                              offset,
++                              sizeof(parameter_request_list)
++    );
++
++    end_dhcp_option(&discovery_, offset);
++
++    /* send the DHCPDISCOVER packet out */
++    return send_dhcp_packet_to(&discovery_, sizeof(discovery_), ifname_, server_address_);
++  }
++
++
++/* waits for a DHCPOFFER message from one or more DHCP servers */
++  void DHCPClient::listen_offer() {
++
++    /* receive as many responses as we can */
++    auto offer_packet = (struct dhcp_packet *) malloc(sizeof(dhcp_packet));
++
++    memset(offer_packet, 0, sizeof(struct dhcp_packet));
++    bzero(offer_packet, sizeof(struct dhcp_packet));
++
++    receive_dhcp_packet(listen_raw_sock_fd_, offer_packet, sizeof(struct dhcp_packet), DHCP_OFFER_TIMEOUT);
++
++    /* check packet xid to see if its the same as the one we used in the discover packet */
++    if (ntohl(offer_packet->xid) != packet_xid_) {
++      return;
++    }
++
++    offer_ = *offer_packet;
++  }
++
++
++  int DHCPClient::do_request(struct in_addr server, struct in_addr requested) {
++    request_ = dhcp_packet_with_headers_set();
++    struct sockaddr_in sockaddr_broadcast;
++
++    int offset = 0;
++    u_int8_t option;
++
++    request_.options[offset++] = 0x63;
++    request_.options[offset++] = 0x82;
++    request_.options[offset++] = 0x53;
++    request_.options[offset++] = 0x63;
++
++    request_.op = BOOTREQUEST;
++
++    offset += add_dhcp_option(&request_,
++                              DHO_DHCP_MESSAGE_TYPE,
++                              &(option = DHCPREQUEST),
++                              offset,
++                              sizeof(option)
++    );
++
++    /* the IP address we're requesting */
++    offset += add_dhcp_option(&request_,
++                              DHO_DHCP_REQUESTED_ADDRESS,
++                              (u_int8_t *) &requested,
++                              offset,
++                              sizeof(requested)
++    );
++
++
++    u_int8_t client_identifier[IFHWADDRLEN];
++    memcpy(client_identifier, hwaddr_, IFHWADDRLEN);
++    offset += add_dhcp_option(&request_,
++                              DHO_DHCP_CLIENT_IDENTIFIER,
++                              (u_int8_t *) &client_identifier,
++                              offset,
++                              IFHWADDRLEN
++    );
++
++    /* the IP address of the server */
++    offset += add_dhcp_option(&request_,
++                              DHO_DHCP_SERVER_IDENTIFIER,
++                              (u_int8_t *) &server,
++                              offset,
++                              sizeof(server)
++    );
++
++    char hostname[1024];
++    hostname[1023] = 0x00;
++    gethostname(hostname, 1023);
++    offset += add_dhcp_option(&request_,
++                              DHO_HOST_NAME,
++                              (u_int8_t *) &hostname,
++                              offset,
++                              (u_int8_t) strlen(hostname)
++    );
++
++    u_int8_t parameter_request_list[] = {
++            DHO_SUBNET_MASK,
++            DHO_BROADCAST_ADDRESS,
++            DHO_TIME_OFFSET,
++            DHO_ROUTERS,
++            DHO_DOMAIN_NAME,
++            DHO_DOMAIN_NAME_SERVERS,
++            DHO_HOST_NAME,
++            DHO_NETBIOS_NAME_SERVERS,
++            DHO_INTERFACE_MTU,
++            DHO_STATIC_ROUTES,
++            DHO_NTP_SERVERS,
++            DHO_DHCP_RENEWAL_TIME,
++            DHO_DHCP_REBINDING_TIME
++    };
++
++    offset += add_dhcp_option(&request_,
++                              DHO_DHCP_PARAMETER_REQUEST_LIST,
++                              (u_int8_t *) &parameter_request_list,
++                              offset,
++                              sizeof(parameter_request_list)
++    );
++
++    end_dhcp_option(&request_, offset);
++
++    /* send the DHCPREQUEST packet to broadcast address */
++    sockaddr_broadcast.sin_family = AF_INET;
++    sockaddr_broadcast.sin_port = htons(DHCP_SERVER_PORT);
++    sockaddr_broadcast.sin_addr.s_addr = INADDR_BROADCAST;
++    bzero(&sockaddr_broadcast.sin_zero, sizeof(sockaddr_broadcast.sin_zero));
++
++    /* send the DHCPREQUEST packet out */
++    send_dhcp_packet_to(&request_, sizeof(dhcp_packet), ifname_, server_address_);
++    return 0;
++  }
++
++  int DHCPClient::listen_acknowledgement(struct in_addr server) {
++    bool res = receive_dhcp_packet(listen_raw_sock_fd_, &acknowledge_, sizeof(dhcp_packet), DHCP_OFFER_TIMEOUT);
++    if (!res) return -1;
++    return 0;
++  }
++
++
++  // ygovil NOTE: DOES NOT WORK RIGHT NOW
++  // Not required for the prototype, so disabled (haven't included leases.h or leases.cpp)
++  bool DHCPClient::gather_lease(char *interface_name) {
++    char server_address[20] = "255.255.255.255";
++    DHCPClient dhcpClient(interface_name, server_address);
++
++    dhcpClient.initialize();
++
++    dhcpClient.do_discover();
++
++    dhcpClient.listen_offer();
++
++    auto offer = dhcpClient.get_offer();
++
++    bool acknowledged = false;
++    struct in_addr server_ip = {};
++    for (auto option : parse_dhcp_packet(&offer)) {
++      if (option.type == DHO_DHCP_SERVER_IDENTIFIER) {
++        memcpy((void *) &server_ip, option.data, option.length);
++      }
++    }
++
++    dhcpClient.do_request(server_ip, offer.yiaddr);
++
++    dhcpClient.listen_acknowledgement(server_ip);
++
++    auto ack_packet = dhcpClient.get_acknowledge();
++    for (auto option : parse_dhcp_packet(&ack_packet)) {
++      if (option.type == DHO_DHCP_MESSAGE_TYPE) {
++        if (*option.data == DHCPACK) {
++          // l = process_lease(&ack_packet);
++          acknowledged = true;
++        } else if (*option.data == DHCPNAK) {
++          // l = process_lease(&ack_packet);
++          continue;
++        }
++      }
++    }
++
++    dhcpClient.cleanup();
++
++    if (acknowledged) {
++      // *ls = l;
++      return true;
++    } else {
++      return false;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/quic/dhcp/dhcp-client.h b/quic/dhcp/dhcp-client.h
+new file mode 100755
+index 00000000..267b936c
+--- /dev/null
++++ b/quic/dhcp/dhcp-client.h
+@@ -0,0 +1,94 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++//
++// Created by cem on 23.07.2018.
++//
++
++#ifndef DHCPCLIENT_DHCPC_H
++#define DHCPCLIENT_DHCPC_H
++
++#include <set>
++#include <memory>
++#include <vector>
++#include <netinet/in.h>
++#include <string>
++#include <net/if.h>
++
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-packet.h"
++//#define DEBUG_PACKET
++
++namespace dhcp {
++  typedef struct dhcp_result {
++
++  } dhcp_result;
++
++  class DHCPClient {
++  private:
++    struct in_addr requested_address_;
++    struct in_addr server_address_;
++    bool request_specific_address_ = false;
++
++    char ifname_[IFNAMSIZ];
++    u_int8_t hwaddr_[16];
++
++    int listen_raw_sock_fd_;
++
++    u_int32_t packet_xid_;
++
++    dhcp_packet discovery_;
++
++    dhcp_packet offer_;
++
++    dhcp_packet request_;
++
++    dhcp_packet acknowledge_;
++
++    struct dhcp_packet dhcp_packet_with_headers_set();
++
++  public:
++    DHCPClient(const char *interface_name, const char *server_address);
++
++    void setRequestSpecificAddress(decltype(request_specific_address_) val) { request_specific_address_ = val; }
++
++    auto getRequestSpecificAddress() -> decltype(request_specific_address_) { return request_specific_address_; }
++
++    auto get_discovery() -> decltype(discovery_) { return discovery_; }
++
++    auto get_offer() -> decltype(offer_) { return offer_; }
++
++    auto get_request() -> decltype(request_) { return request_; }
++
++    auto get_acknowledge() -> decltype(acknowledge_) { return acknowledge_; }
++
++    int do_discover();
++
++    void listen_offer();
++
++    int do_request(struct in_addr server, struct in_addr requested);
++
++    int listen_acknowledgement(struct in_addr server);
++
++    void initialize();
++
++    void cleanup();
++
++    static bool gather_lease(char *interface_name);
++  };
++
++  class DHCPException : public std::exception {
++  protected:
++    std::runtime_error msg_;
++  public:
++    explicit DHCPException(const char *message) : msg_(message) {}
++
++    explicit DHCPException(const std::string &message) : msg_(message) {}
++
++    ~DHCPException() final = default;
++
++    const char *what() const noexcept final { return msg_.what(); }
++  };
++
++}
++#endif //DHCPCLIENT_DHCPC_H
+diff --git a/quic/dhcp/dhcp-packet.cpp b/quic/dhcp/dhcp-packet.cpp
+new file mode 100755
+index 00000000..7739c1f5
+--- /dev/null
++++ b/quic/dhcp/dhcp-packet.cpp
+@@ -0,0 +1,487 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++//
++// Created by cem on 23.07.2018.
++//
++
++#include <cstdio>
++#include <cstring>
++#include <sys/types.h>
++#include <cerrno>
++#include <arpa/inet.h>
++#include <iostream>
++#include <map>
++
++#include <unistd.h>
++
++#include <ifaddrs.h>
++
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-packet.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-client.h"
++#include <net/if.h>
++#include <sys/ioctl.h>
++
++namespace dhcp {
++  std::string inAddrToString(struct in_addr iAddr) 
++  {
++    char str[INET_ADDRSTRLEN + 1];
++    inet_ntop(AF_INET, &iAddr, str, INET_ADDRSTRLEN);
++    str[INET_ADDRSTRLEN] = 0;
++    std::string s(str);
++    return s;
++  }
++
++  struct in_addr stringToInAddr(std::string addrString) 
++  {
++    struct in_addr iAddr;
++    inet_pton(AF_INET, addrString.c_str(), &iAddr);
++    return iAddr;
++  }
++
++  struct in_addr getIPofInterface(char *ifname)
++  {
++    struct ifaddrs *ifa;
++    struct ifaddrs *ifaOrig;
++    struct in_addr myIP;
++    memset(&myIP, 0x00, sizeof(struct in_addr));
++
++    // get interfaces
++    int ret = getifaddrs(&ifa);
++    if (ret != 0) {
++      perror("Error getting interfaces");
++    } 
++    else {
++      ifaOrig = ifa;
++      // keep going until the last element in the interfaces array
++      while (ifa != NULL) {
++
++        if (strcmp(ifa->ifa_name, ifname) == 0) {
++          myIP = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
++          break;
++        }
++
++        ifa = ifa->ifa_next;
++      }
++
++      freeifaddrs(ifaOrig);
++    }
++
++    return myIP;
++  }
++
++  inline void print_packet(const u_int8_t *data, int len) {
++#if defined(DEBUG_PACKET)
++    for (int i = 0; i < len; i++) {
++      if (i % 0x10 == 0) {
++        printf("\n%04x ::\t", i);
++      }
++      if( i % 0x08 == 0){
++        printf("   ");
++      }
++      printf("%02x ", data[i]);
++    }
++    printf("\n");
++#endif
++  }
++
++  u_int32_t udp_checksum_s(char *ip, char *udp, u_int16_t length) {
++    udp[6] = udp[7] = 0;
++    struct udp_pseudoheader header = {};
++    u_int32_t checksum = 0x0;
++    memcpy((char *) &header.srcaddr, &ip[12], 4);
++    memcpy((char *) &header.dstaddr, &ip[16], 4);
++    header.zero = 0;
++    header.protocol = IPPROTO_UDP;
++    header.length = htons(length);
++    auto hptr = (u_int16_t *) &header;
++    for (int hlen = sizeof(header); hlen > 0; hlen -= 2) {
++      checksum += *(hptr++);
++    }
++    auto uptr = (u_int16_t *) udp;
++    for (; length > 1; length -= 2) {
++      checksum += *(uptr++);
++    }
++    if (length) {
++      checksum += *((u_int8_t *) uptr);
++    }
++    do {
++      checksum = (checksum >> 16u) + (checksum & 0xFFFFu);
++    } while (checksum != (checksum & 0xFFFFu));
++    auto ans = (u_int16_t) checksum;
++    return (ans == 0xFF) ? 0xFF : ntohs(~ans);
++  }
++
++/* sends a DHCP packet to specified server IP (unicast) */
++  int send_dhcp_packet_to(void *buffer, int buffer_size, char *ifname, struct in_addr server_address) {
++
++    int result = -1;
++    auto buf = (char *) malloc(
++            sizeof(struct ethhdr) +     // 14
++            sizeof(struct iphdr) +      // 20
++            sizeof(struct udphdr) +     // 8
++            sizeof(struct dhcp_packet)   // 548
++    );
++
++    memcpy(&buf[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(udphdr)],
++           buffer,
++           (size_t) buffer_size);
++
++    // Construction of eth header
++    auto ethh = (struct ethhdr *) (buf);
++
++    struct ifreq ifr = {};
++    memset(&ifr, 0, sizeof(ifreq));
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
++    int ifreq_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
++    ioctl(ifreq_sock, SIOCGIFHWADDR, &ifr);
++    close(ifreq_sock);
++
++    memset(ethh->h_dest, 0xff, IFHWADDRLEN);
++    memcpy((void *) &ethh->h_source, &ifr.ifr_hwaddr.sa_data, IFHWADDRLEN);
++    ethh->h_proto = htons(ETH_P_IP);
++
++    // Construction of udp header
++    auto udph = (struct udphdr *) (buf + sizeof(struct ethhdr) + sizeof(struct iphdr));
++    udph->source = htons(DHCP_CLIENT_PORT);
++    udph->dest = htons(DHCP_SERVER_PORT);
++    udph->len = htons(buffer_size + sizeof(struct udphdr));
++    udph->check = 0x0;
++
++    // find source and destination IP (0.0.0.0 to 255.255.255.255 by default)
++    struct in_addr srcaddr = stringToInAddr("0.0.0.0");
++    struct in_addr dstaddr = stringToInAddr("255.255.255.255");
++
++    struct in_addr myIP = getIPofInterface(ifname);
++    if (myIP.s_addr != 0) {
++      srcaddr = myIP;
++      dstaddr = server_address;
++    }
++
++    // Construction of ip header https://www.inetdaemon.com/tutorials/internet/ip/datagram_structure.shtml
++    auto iph = (struct iphdr *) (buf + sizeof(struct ethhdr));
++    iph->version = IPVERSION;
++    iph->ihl = 5;
++    iph->tos = 0x10;
++    iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + buffer_size);
++    iph->id = 0;
++    iph->frag_off = 0;
++    iph->ttl = 0x80;
++    iph->protocol = IPPROTO_UDP;
++    iph->check = 0x0;
++    iph->saddr = srcaddr.s_addr;
++    iph->daddr = dstaddr.s_addr;
++    // inet_aton("0.0.0.0", (struct in_addr *) &iph->saddr);
++    // inet_aton("255.255.255.255", (struct in_addr *) &iph->daddr);
++
++    udph->check = htons((u_int16_t)
++                                udp_checksum_s((char *) iph, (char *) udph, buffer_size + sizeof(struct udphdr)));
++    iph->check = (u_int16_t)
++            ip_checksum(iph);
++
++    int total_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + buffer_size;
++
++    struct sockaddr_ll device = {};
++    if ((device.sll_ifindex = if_nametoindex(ifname)) == 0) {
++      std::cout << "Failed to resolve interface index: " << std::string(strerror(errno)) << std::endl;
++      return -1;
++      // throw DHCPException("Failed to resolve interface index: " + std::string(strerror(errno)));
++    }
++
++    int sendv4_sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
++
++    result = (int) sendto(sendv4_sock, buf, (size_t) total_len, 0, (struct sockaddr *) &device, sizeof(device));
++
++    close(sendv4_sock);
++
++    print_packet((u_int8_t *) buf, result);
++
++    free(buf);
++    if (result < 0) {
++      std::cout << "Can not send dhcp request: " << std::string(strerror(errno)) << std::endl;
++      return -1;
++      // throw DHCPException("Can not send dhcp request: " + std::string(strerror(errno)));
++    }
++    return result;
++  }
++
++/* sends a DHCP packet */
++  int send_dhcp_packet(void *buffer, int buffer_size, char *ifname) {
++
++    int result = -1;
++    auto buf = (char *) malloc(
++            sizeof(struct ethhdr) +     // 14
++            sizeof(struct iphdr) +      // 20
++            sizeof(struct udphdr) +     // 8
++            sizeof(struct dhcp_packet)   // 548
++    );
++
++    memcpy(&buf[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(udphdr)],
++           buffer,
++           (size_t) buffer_size);
++
++    // Construction of eth header
++    auto ethh = (struct ethhdr *) (buf);
++
++    struct ifreq ifr = {};
++    memset(&ifr, 0, sizeof(ifreq));
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
++    int ifreq_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
++    ioctl(ifreq_sock, SIOCGIFHWADDR, &ifr);
++    close(ifreq_sock);
++
++    memset(ethh->h_dest, 0xff, IFHWADDRLEN);
++    memcpy((void *) &ethh->h_source, &ifr.ifr_hwaddr.sa_data, IFHWADDRLEN);
++    ethh->h_proto = htons(ETH_P_IP);
++
++    // Construction of udp header
++    auto udph = (struct udphdr *) (buf + sizeof(struct ethhdr) + sizeof(struct iphdr));
++    udph->source = htons(DHCP_CLIENT_PORT);
++    udph->dest = htons(DHCP_SERVER_PORT);
++    udph->len = htons(buffer_size + sizeof(struct udphdr));
++    udph->check = 0x0;
++
++    // Construction of ip header https://www.inetdaemon.com/tutorials/internet/ip/datagram_structure.shtml
++    auto iph = (struct iphdr *) (buf + sizeof(struct ethhdr));
++    iph->version = IPVERSION;
++    iph->ihl = 5;
++    iph->tos = 0x10;
++    iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + buffer_size);
++    iph->id = 0;
++    iph->frag_off = 0;
++    iph->ttl = 0x80;
++    iph->protocol = IPPROTO_UDP;
++    iph->check = 0x0;
++    inet_aton("0.0.0.0", (struct in_addr *) &iph->saddr);
++    inet_aton("255.255.255.255", (struct in_addr *) &iph->daddr);
++
++    udph->check = htons((u_int16_t)
++                                udp_checksum_s((char *) iph, (char *) udph, buffer_size + sizeof(struct udphdr)));
++    iph->check = (u_int16_t)
++            ip_checksum(iph);
++
++    int total_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + buffer_size;
++
++    struct sockaddr_ll device = {};
++    if ((device.sll_ifindex = if_nametoindex(ifname)) == 0) {
++      std::cout << "Failed to resolve interface index: " << std::string(strerror(errno)) << std::endl;
++      return -1;
++      // throw DHCPException("Failed to resolve interface index: " + std::string(strerror(errno)));
++    }
++
++    int sendv4_sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
++
++    result = (int) sendto(sendv4_sock, buf, (size_t) total_len, 0, (struct sockaddr *) &device, sizeof(device));
++
++    close(sendv4_sock);
++
++    print_packet((u_int8_t *) buf, result);
++
++    free(buf);
++    if (result < 0) {
++      std::cout << "Can not send dhcp request: " << std::string(strerror(errno)) << std::endl;
++      return -1;
++      // throw DHCPException("Can not send dhcp request: " + std::string(strerror(errno)));
++    }
++    return result;
++  }
++
++/* receives a DHCP packet */
++  bool receive_dhcp_packet(int sock, void *packet, int packet_size, int timeout) {
++
++    size_t max_length = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + packet_size;
++
++    struct dhcp_packet incoming_packet = {};
++    memset(&incoming_packet, 0, sizeof(incoming_packet));
++    // bzero(&incoming_packet, sizeof(incoming_packet));
++
++    u_int8_t *buf;
++    buf = (u_int8_t *) malloc(max_length * 2);
++    bzero(buf, max_length);
++
++    int len = 0;
++    int read_count = 0;
++    for (bool valid = false; not valid and read_count < 4; valid = validate_dhcp_packet(buf, len)) {
++      len = (int) recv(sock, buf, max_length, 0);
++      // read_count++;
++      if (len < 0) {
++        std::cout << "Can not receive DHCP packet: " << std::string(strerror(errno)) << std::endl;
++        return false;
++        // throw DHCPException("Can not receive DHCP packet: " + std::string(strerror(errno)));
++      }
++
++      memcpy(&incoming_packet,
++             &buf[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)],
++             len - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
++      );
++    }
++
++    print_packet(buf, (int) max_length);
++    memcpy(packet, &incoming_packet, sizeof(struct dhcp_packet));
++    free(buf);
++    return true;
++  }
++
++  int add_dhcp_option(struct dhcp_packet *packet, u_int8_t code, u_int8_t *data, int offset, u_int8_t len) {
++
++    packet->options[offset] = code;
++    packet->options[offset + 1] = len;
++
++    memcpy(&packet->options[offset + 2], data, len);
++    return len + (sizeof(u_int8_t) * 2);
++  }
++
++  void end_dhcp_option(struct dhcp_packet *packet, int offset) {
++    u_int8_t option = DHO_PAD;
++    add_dhcp_option(packet, DHO_END, &option, offset, sizeof(option));
++  }
++
++  std::vector<dhcp_option> parse_dhcp_packet(struct dhcp_packet *packet) {
++
++    std::vector<dhcp_option> options;
++
++    if (packet == nullptr)
++      return options;
++    if (packet->options[0] != 0x63) {
++      return options;
++    } else if (packet->options[1] != 0x82) {
++      return options;
++    } else if (packet->options[2] != 0x53) {
++      return options;
++    } else if (packet->options[3] != 0x63) {
++      return options;
++    }
++
++    /* process all DHCP options present in the packet */
++    for (int s, x = 4; x < DHCP_MAX_OPTION_LEN; x += s) {
++
++      /* end of options (0 is really just a pad, but bail out anyway) */
++      if ((int) packet->options[x] == -1 || (int) packet->options[x] == 0) {
++        break;
++      }
++
++      dhcp_option option = {};
++
++      /* get option type */
++      option.type = (u_int8_t) packet->options[x++];
++
++      /* get option length */
++      option.length = (u_int8_t) packet->options[x++];
++
++      s = option.length;
++
++      /* get option data */
++      option.data = (u_int8_t *) malloc(option.length * sizeof(u_int8_t));
++
++      /* Copy data to option struct */
++      memcpy(option.data, (void *) &packet->options[x], option.length);
++
++      /* Push it in the vector */
++      options.push_back(option);
++
++      if (option.type == DHO_END) {
++        break;
++      }
++    }
++#if defined(DEBUG)
++    for(auto option : options){
++      printf("Option, Type: %3u, Lenght: %02X, Data: ", option.type, option.length);
++      for(int i = 0; i < option.length; i ++){
++        printf("%02X ", option.data[i]);
++      }
++      printf("\n");
++    }
++#endif
++  return options;
++  }
++
++  u_int32_t calculate_checksum(const u_int8_t *buf, int len, u_int32_t sum) {
++    uint i;
++    /* Checksum all the pairs of bytes first... */
++    for (i = 0; i < (len & ~1U); i += 2) {
++      sum += (u_int16_t) ntohs(*((u_int16_t *) (buf + i)));
++      if (sum > 0xFFFF)
++        sum -= 0xFFFF;
++    }
++
++    /*
++     * If there's a single byte left over, checksum it, too.
++     * Network byte order is big-endian, so the remaining byte is
++     * the high byte.
++     */
++    if (i < (uint) len) {
++      sum += buf[i] << 8;
++      if (sum > 0xFFFF)
++        sum -= 0xFFFF;
++    }
++    return sum;
++  }
++
++
++  uint32_t ip_checksum(iphdr *ip_header) {
++    ip_header->check = 0;
++    auto sum = calculate_checksum((u_int8_t *) ip_header, ip_header->ihl * 4, 0);
++    sum = ~sum & 0xFFFFu;
++    return htons((u_int16_t) sum);
++  }
++
++  bool validate_dhcp_packet(u_int8_t *packet, int size) {
++    struct iphdr ip_header = {};
++    memset(&ip_header, 0, sizeof(ip_header));
++    bzero(&ip_header, sizeof(ip_header));
++
++    struct udphdr udp_header = {};
++    memset(&udp_header, 0, sizeof(udp_header));
++    bzero(&udp_header, sizeof(udp_header));
++
++    struct dhcp_packet dhcp_p = {};
++    memset(&dhcp_p, 0, sizeof(dhcp_p));
++    bzero(&dhcp_p, sizeof(dhcp_p));
++
++    memcpy(&ip_header,
++           &packet[sizeof(struct ethhdr)],
++           sizeof(struct iphdr)
++    );
++
++    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/master/sbin/dhclient/packet.c
++    // https://gist.github.com/GreenRecycleBin/1273763
++
++    memcpy(&udp_header,
++           &packet[sizeof(struct ethhdr) + sizeof(struct iphdr)],
++           sizeof(struct udphdr)
++    );
++
++    memcpy(&dhcp_p,
++           &packet[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)],
++           size - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
++    );
++
++    auto given_ip_checksum = ip_header.check;
++    ip_header.check = 0;
++
++    if (given_ip_checksum != ip_checksum(&ip_header)) {
++      return false;
++    }
++
++    if (dhcp_p.op != BOOTREPLY) {
++      return false;
++    }
++
++    if (dhcp_p.options[0] != 0x63)
++      return false;
++    if (dhcp_p.options[1] != 0x82)
++      return false;
++    if (dhcp_p.options[2] != 0x53)
++      return false;
++    if (dhcp_p.options[3] != 0x63)
++      return false;
++
++    return true;
++  }
++}
+\ No newline at end of file
+diff --git a/quic/dhcp/dhcp-packet.h b/quic/dhcp/dhcp-packet.h
+new file mode 100755
+index 00000000..42bc718b
+--- /dev/null
++++ b/quic/dhcp/dhcp-packet.h
+@@ -0,0 +1,152 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++//
++// Created by cem on 23.07.2018.
++//
++
++#ifndef DHCPCLIENT_DHCP_REQUEST_H
++#define DHCPCLIENT_DHCP_REQUEST_H
++
++#include <cstdio>
++#include <vector>
++
++#include "net/third_party/quiche/src/quic/dhcp/dhcp.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-client.h"
++
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++
++
++namespace dhcp {
++/**
++ * @brief UDP Pseudoheader
++ */
++  typedef struct udp_pseudoheader {
++    uint32_t srcaddr;
++    uint32_t dstaddr;
++    uint8_t zero;
++    uint8_t protocol;
++    uint16_t length;
++  } udp_pseudoheader;
++
++  typedef struct dhcp_option {
++    u_int8_t length;
++    u_int8_t type;
++    u_int8_t *data;
++  } dhcp_option;
++
++
++/**
++ * @brief Converts std::string format to in_addr format
++ * @param addrString is a string of the format X.X.X.X, where each X is in [0,255]
++ * @return the IP denoted by addrString as a in_addr struct
++ */
++struct in_addr stringToInAddr(std::string addrString);
++
++/**
++ * @brief Converts in_addr format to a std::string
++ * @param iAddr is an IP address as an in_addr struct 
++ * @return the IP denoted by iAddr as a string of the format X.X.X.X, where each X is in [0,255]
++ */
++std::string inAddrToString(struct in_addr iAddr);
++
++/**
++ * @brief Gets the IP address assigned to an interface
++ * @param ifname is the name of an interface
++ * @return the IP assigned to ifname, 0.0.0.0 address if not found
++ */
++struct in_addr getIPofInterface(char *ifname);
++
++/**
++ * @brief Prints packet just for debugging
++ * @param data Data to be printed
++ * @param len lenght of the data
++ */
++  void print_packet(const u_int8_t *data, int len);
++
++/**
++ * @brief Sends packets with specified values over socket
++ * @param buffer value to send to socket
++ * @param buffer_size size of the package
++ * @param ifname name of the interface
++ * @return Success value: -1 if fails 0 if succeed
++ */
++  int
++  send_dhcp_packet(void *buffer, int buffer_size, char *ifname);
++
++/**
++ * @brief Sends packets with specified values over socket
++ * @param buffer value to send to socket
++ * @param buffer_size size of the package
++ * @param ifname name of the interface
++ * @param server_address address of the dhcp server
++ * @return Success value: -1 if fails 0 if succeed
++ */
++  int
++  send_dhcp_packet_to(void *buffer, int buffer_size, char *ifname, struct in_addr server_address);
++
++/**
++ * @brief Receives packet with specified values
++ * \param packet to be written
++ * \param packet_size buffer size to be written in buffer
++ * \param sock socker file descriptor
++ * \param timeout in seconds
++ * \param address address to be received
++ * @return Success value: -1 if fails 0 if succeed
++ */
++  bool receive_dhcp_packet(int sock, void *packet, int packet_size, int timeout);
++
++/**
++ * @brief Adds option to dhcp packet with given offset
++ * @param packet
++ * @param code
++ * @param data
++ * @param offset
++ * @param len
++ * @return
++ */
++  int add_dhcp_option(struct dhcp_packet *packet, u_int8_t code, u_int8_t *data, int offset, u_int8_t len);
++
++/**
++ * @brief Specialized add dhcp option function that puts end flag to end of the options
++ * @param packet
++ * @param offset
++ */
++  void end_dhcp_option(struct dhcp_packet *packet, int offset);
++
++/**
++ * @brief Checks if packet is invalid or not
++ * @param packet
++ * @return true if valid, else false
++ */
++  bool validate_dhcp_packet(u_int8_t *packet, int size);
++
++
++/**
++ * @brief Calculates checksum of given buffer
++ * @param buf buffer to be calculated
++ * @param len length of the buffer
++ * @param sum pre-given sum, generally 0
++ * @return sum of the buffer
++ */
++  u_int32_t calculate_checksum(const u_int8_t *buf, int len, u_int32_t sum);
++
++/**
++ * @brief calculates the ip header checksum
++ * @param ip_header
++ * @return checksum of ip header
++ */
++  uint32_t ip_checksum(iphdr *ip_header);
++
++  u_int32_t udp_checksum_s(char *ip, char *udp, u_int16_t length);
++
++/**
++ * @brief Parses the packet and put it in the vector
++ * @param packet pointer
++ * @return objects
++ */
++  std::vector<dhcp_option> parse_dhcp_packet(struct dhcp_packet *packet);
++}
++#endif //DHCPCLIENT_DHCP_REQUEST_H
+diff --git a/quic/dhcp/dhcp.h b/quic/dhcp/dhcp.h
+new file mode 100755
+index 00000000..ed22920b
+--- /dev/null
++++ b/quic/dhcp/dhcp.h
+@@ -0,0 +1,207 @@
++/* dhcp.h
++   Protocol structures... */
++
++/*
++ * Copyright (c) 2004,2005,2008 by Internet Systems Consortium, Inc. ("ISC")
++ * Copyright (c) 1995-2003 by Internet Software Consortium
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL ISC BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
++ * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ *   Internet Systems Consortium, Inc.
++ *   950 Charter Street
++ *   Redwood City, CA 94063
++ *   <info@isc.org>
++ *   http://www.isc.org/
++ *
++ * This software has been written for Internet Systems Consortium
++ * by Ted Lemon in cooperation with Vixie Enterprises.  To learn more
++ * about Internet Systems Consortium, see ``http://www.isc.org''.
++ * To learn more about Vixie Enterprises, see ``http://www.vix.com''.
++ */
++
++#ifndef DHCP_H
++#define DHCP_H
++
++#include <sys/types.h>
++#include <netinet/in.h>
++
++#define DHCP_UDP_OVERHEAD	(20 + /* IP header */			\
++              			        8)   /* UDP header */
++#define DHCP_SNAME_LEN		    64
++#define DHCP_FILE_LEN	        128
++#define DHCP_FIXED_NON_UDP	  236
++#define DHCP_FIXED_LEN		  (DHCP_FIXED_NON_UDP + DHCP_UDP_OVERHEAD)
++/* Everything but options. */
++#define BOOTP_MIN_LEN		300
++
++#define DHCP_MTU_MAX		1500
++#define DHCP_MTU_MIN    576
++
++#define DHCP_MAGIC_COOKIE_LEN 4
++
++#define DHCP_MAX_OPTION_LEN	(DHCP_MTU_MAX - DHCP_FIXED_LEN - DHCP_MAGIC_COOKIE_LEN)
++#define DHCP_MIN_OPTION_LEN (DHCP_MTU_MIN - DHCP_FIXED_LEN)
++
++#define DHCP_MAGIC_COOKIE 0x63825363
++
++struct dhcp_packet {
++  u_int8_t  op;		/* 0: Message opcode/type */
++  u_int8_t  htype;	/* 1: Hardware addr type (net/if_types.h) */
++  u_int8_t  hlen;		/* 2: Hardware addr length */
++  u_int8_t  hops;		/* 3: Number of relay agent hops from client */
++  u_int32_t xid;		/* 4: Transaction ID */
++  u_int16_t secs;		/* 8: Seconds since client started looking */
++  u_int16_t flags;	/* 10: Flag bits */
++  struct in_addr ciaddr;	/* 12: Client IP address (if already in use) */
++  struct in_addr yiaddr;	/* 16: Client IP address */
++  struct in_addr siaddr;	/* 18: IP address of next server to talk to */
++  struct in_addr giaddr;	/* 20: DHCP relay agent IP address */
++  unsigned char chaddr [16];	/* 24: Client hardware address */
++  char sname [DHCP_SNAME_LEN];	/* 40: Server name */
++  char file [DHCP_FILE_LEN];	/* 104: Boot filename */
++	unsigned char options[DHCP_MIN_OPTION_LEN];
++  /* 212: Optional parameters
++     (actual length dependent on MTU). */
++};
++
++/* BOOTP (rfc951) message types */
++#define	BOOTREQUEST	1
++#define BOOTREPLY	2
++
++/* Possible values for flags field... */
++#define BOOTP_UNICAST 0x0000
++#define BOOTP_BROADCAST 0x8000
++
++/* Possible values for hardware type (htype) field... */
++#define HTYPE_ETHER	1               /* Ethernet 10Mbps              */
++#define HTYPE_IEEE802	6               /* IEEE 802.2 Token Ring...	*/
++#define HTYPE_FDDI	8		/* FDDI...			*/
++
++/* Magic cookie validating dhcp options field (and bootp vendor
++   extensions field). */
++#define DHCP_OPTIONS_COOKIE	"\143\202\123\143"
++
++/* DHCP Option codes: */
++
++#define DHO_PAD				0
++#define DHO_SUBNET_MASK			1
++#define DHO_TIME_OFFSET			2
++#define DHO_ROUTERS			3
++#define DHO_TIME_SERVERS		4
++#define DHO_NAME_SERVERS		5
++#define DHO_DOMAIN_NAME_SERVERS		6
++#define DHO_LOG_SERVERS			7
++#define DHO_COOKIE_SERVERS		8
++#define DHO_LPR_SERVERS			9
++#define DHO_IMPRESS_SERVERS		10
++#define DHO_RESOURCE_LOCATION_SERVERS	11
++#define DHO_HOST_NAME			12
++#define DHO_BOOT_SIZE			13
++#define DHO_MERIT_DUMP			14
++#define DHO_DOMAIN_NAME			15
++#define DHO_SWAP_SERVER			16
++#define DHO_ROOT_PATH			17
++#define DHO_EXTENSIONS_PATH		18
++#define DHO_IP_FORWARDING		19
++#define DHO_NON_LOCAL_SOURCE_ROUTING	20
++#define DHO_POLICY_FILTER		21
++#define DHO_MAX_DGRAM_REASSEMBLY	22
++#define DHO_DEFAULT_IP_TTL		23
++#define DHO_PATH_MTU_AGING_TIMEOUT	24
++#define DHO_PATH_MTU_PLATEAU_TABLE	25
++#define DHO_INTERFACE_MTU		26
++#define DHO_ALL_SUBNETS_LOCAL		27
++#define DHO_BROADCAST_ADDRESS		28
++#define DHO_PERFORM_MASK_DISCOVERY	29
++#define DHO_MASK_SUPPLIER		30
++#define DHO_ROUTER_DISCOVERY		31
++#define DHO_ROUTER_SOLICITATION_ADDRESS	32
++#define DHO_STATIC_ROUTES		33
++#define DHO_TRAILER_ENCAPSULATION	34
++#define DHO_ARP_CACHE_TIMEOUT		35
++#define DHO_IEEE802_3_ENCAPSULATION	36
++#define DHO_DEFAULT_TCP_TTL		37
++#define DHO_TCP_KEEPALIVE_INTERVAL	38
++#define DHO_TCP_KEEPALIVE_GARBAGE	39
++#define DHO_NIS_DOMAIN			40
++#define DHO_NIS_SERVERS			41
++#define DHO_NTP_SERVERS			42
++#define DHO_VENDOR_ENCAPSULATED_OPTIONS	43
++#define DHO_NETBIOS_NAME_SERVERS	44
++#define DHO_NETBIOS_DD_SERVER		45
++#define DHO_NETBIOS_NODE_TYPE		46
++#define DHO_NETBIOS_SCOPE		47
++#define DHO_FONT_SERVERS		48
++#define DHO_X_DISPLAY_MANAGER		49
++#define DHO_DHCP_REQUESTED_ADDRESS	50
++#define DHO_DHCP_LEASE_TIME		51
++#define DHO_DHCP_OPTION_OVERLOAD	52
++#define DHO_DHCP_MESSAGE_TYPE		53
++#define DHO_DHCP_SERVER_IDENTIFIER	54
++#define DHO_DHCP_PARAMETER_REQUEST_LIST	55
++#define DHO_DHCP_MESSAGE		56
++#define DHO_DHCP_MAX_MESSAGE_SIZE	57
++#define DHO_DHCP_RENEWAL_TIME		58
++#define DHO_DHCP_REBINDING_TIME		59
++#define DHO_VENDOR_CLASS_IDENTIFIER	60
++#define DHO_DHCP_CLIENT_IDENTIFIER	61
++#define DHO_NWIP_DOMAIN_NAME		62
++#define DHO_NWIP_SUBOPTIONS		63
++#define DHO_USER_CLASS			77
++#define DHO_FQDN			81
++#define DHO_DHCP_AGENT_OPTIONS		82
++#define DHO_SUBNET_SELECTION		118 /* RFC3011! */
++/* The DHO_AUTHENTICATE option is not a standard yet, so I've
++   allocated an option out of the "local" option space for it on a
++   temporary basis.  Once an option code number is assigned, I will
++   immediately and shamelessly break this, so don't count on it
++   continuing to work. */
++#define DHO_AUTHENTICATE		210
++
++#define DHO_END				255
++
++/* DHCP message types. */
++#define DHCPDISCOVER	1
++#define DHCPOFFER	2
++#define DHCPREQUEST	3
++#define DHCPDECLINE	4
++#define DHCPACK		5
++#define DHCPNAK		6
++#define DHCPRELEASE	7
++#define DHCPINFORM	8
++
++/* Relay Agent Information option subtypes: */
++#define RAI_CIRCUIT_ID	1
++#define RAI_REMOTE_ID	2
++#define RAI_AGENT_ID	3
++
++/* FQDN suboptions: */
++#define FQDN_NO_CLIENT_UPDATE		1
++#define FQDN_SERVER_UPDATE		2
++#define FQDN_ENCODED			3
++#define FQDN_RCODE1			4
++#define FQDN_RCODE2			5
++#define FQDN_HOSTNAME			6
++#define FQDN_DOMAINNAME			7
++#define FQDN_FQDN			8
++#define FQDN_SUBOPTION_COUNT	8
++
++
++/* SPECIFIED FOR ONLY THIS LIBRARY. NOT A STANDARD*/
++#define DHCP_CLIENT_PORT  68
++#define DHCP_SERVER_PORT  67
++
++#define DHCP_OFFER_TIMEOUT 2
++#define DHCP_INFINITE_TIME 0xffffffff
++
++#endif
+\ No newline at end of file
+diff --git a/quic/dhcp/lease.cpp b/quic/dhcp/lease.cpp
+new file mode 100755
+index 00000000..e4b68e40
+--- /dev/null
++++ b/quic/dhcp/lease.cpp
+@@ -0,0 +1,62 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++#include <iostream>
++#include <cstring>
++
++#include "net/third_party/quiche/src/quic/dhcp/lease.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-packet.h"
++
++namespace dhcp {
++  struct lease process_lease(struct dhcp_packet *packet) {
++
++    struct lease l = {};
++    bzero(&l, sizeof(l));
++    l.valid = true;
++    auto options = parse_dhcp_packet(packet);
++    for (auto option : options) {
++      if (option.type == DHO_DOMAIN_NAME_SERVERS) {
++        for (int i = 0; i < option.length; i += sizeof(struct in_addr)) {
++          struct in_addr dns = {};
++          memcpy(&dns, option.data + i, sizeof(dns));
++          l.domain_name_servers.push_back(dns);
++        }
++      } else if (option.type == DHO_DHCP_SERVER_IDENTIFIER) {
++        memcpy(&l.server_identifier, option.data, option.length);
++      } else if (option.type == DHO_SUBNET_MASK) {
++        memcpy(&l.subnet_mask, option.data, option.length);
++      } else if (option.type == DHO_ROUTERS) {
++        memcpy(&l.routers, option.data,
++               sizeof(l.routers)); // im not so sure why it is names routerS. Staying in safe zone.
++      } else if (option.type == DHO_DHCP_LEASE_TIME) {
++        memcpy(&l.lease_time, option.data, option.length);
++        l.lease_time = htonl((u_int32_t) l.lease_time);
++      } else if (option.type == DHO_DHCP_RENEWAL_TIME) {
++        memcpy(&l.renew, option.data, option.length);
++        l.renew = htonl((u_int32_t) l.renew);
++      } else if (option.type == DHO_DHCP_REBINDING_TIME) {
++        memcpy(&l.rebind, option.data, option.length);
++        l.rebind = htonl((u_int32_t) l.rebind);
++      } else if (option.type == DHO_DHCP_MESSAGE_TYPE) {
++        memcpy(&l.message_type, option.data, option.length);
++      }
++    }
++
++    u_int32_t u_subnet;
++    memcpy(&u_subnet, &l.subnet_mask.s_addr, sizeof(u_subnet));
++
++    u_int32_t u_route;
++    memcpy(&u_route, &l.routers.s_addr, sizeof(u_route));
++    u_int32_t broadcast_addr = u_route | (~u_subnet);
++
++    memcpy(&l.broadcast_addr, (void *) &broadcast_addr, sizeof(in_addr));
++
++    memcpy(&l.address, &packet->yiaddr, sizeof(l.address));
++    if (l.renew == 0) {
++      l.renew = l.lease_time / 2;
++    }
++
++    return l;
++  }
++}
+\ No newline at end of file
+diff --git a/quic/dhcp/lease.h b/quic/dhcp/lease.h
+new file mode 100755
+index 00000000..7a87e6fd
+--- /dev/null
++++ b/quic/dhcp/lease.h
+@@ -0,0 +1,39 @@
++/*
++ * From: https://github.com/incebellipipo/dhcp-cpp
++*/
++
++#ifndef DHCPCLIENT_LEASE_H
++#define DHCPCLIENT_LEASE_H
++
++#include <sys/types.h>
++#include "net/third_party/quiche/src/quic/dhcp/dhcp.h"
++#include <vector>
++
++#define DNS_NAME_LEN 100
++namespace dhcp {
++  typedef struct lease {
++
++    char *ifname;
++    struct in_addr address;
++    struct in_addr subnet_mask;
++    struct in_addr broadcast_addr;
++    struct in_addr netmask_addr;
++    struct in_addr routers; // todo why this is routers?
++    u_int8_t message_type;
++    struct in_addr server_identifier;
++    std::vector<struct in_addr> domain_name_servers;
++
++    time_t lease_time;
++    time_t renew;
++    time_t rebind;
++    time_t expire; // not used yet
++
++    bool valid = false;
++  } lease;
++
++  struct lease process_lease(struct dhcp_packet *packet);
++
++}
++#define DEFAULT_LEASE_PATH "/var/lib/dhcp-cpp/"
++
++#endif //DHCPCLIENT_LEASE_H
+diff --git a/quic/tools/quic_toy_client.cc b/quic/tools/quic_toy_client.cc
+index 4c4a1f51..3adfd8cb 100644
+--- a/quic/tools/quic_toy_client.cc
++++ b/quic/tools/quic_toy_client.cc
+@@ -40,19 +40,35 @@
+ // After submitting changes to this file, you will need to follow the
+ // instructions at go/quic_client_binary_update
+ 
++#define QUIC_TOY_CLIENT_MAX_BODY_CHARS 1800
++
+ #include "net/third_party/quiche/src/quic/tools/quic_toy_client.h"
+ 
+ #include <iostream>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
++#include <thread>
++#include <chrono>
++
++#include <sys/ioctl.h>
++#include <arpa/inet.h>
++#include <net/if.h>
++
++#include <sys/types.h>
++#include <ifaddrs.h>
++
++#include "net/third_party/quiche/src/quic/dhcp/dhcp.h"
++#include "net/third_party/quiche/src/quic/dhcp/lease.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-packet.h"
++#include "net/third_party/quiche/src/quic/dhcp/dhcp-client.h"
+ 
+ #include "net/third_party/quiche/src/quic/core/quic_packets.h"
+ #include "net/third_party/quiche/src/quic/core/quic_server_id.h"
+ #include "net/third_party/quiche/src/quic/core/quic_utils.h"
+ #include "net/third_party/quiche/src/quic/core/quic_versions.h"
+ #include "net/third_party/quiche/src/quic/platform/api/quic_default_proof_providers.h"
+-#include "net/third_party/quiche/src/quic/platform/api/quic_ptr_util.h"
+ #include "net/third_party/quiche/src/quic/platform/api/quic_socket_address.h"
+ #include "net/third_party/quiche/src/quic/platform/api/quic_str_cat.h"
+ #include "net/third_party/quiche/src/quic/platform/api/quic_string_piece.h"
+@@ -63,13 +79,13 @@
+ 
+ namespace {
+ 
+-using quic::QuicSocketAddress;
+ using quic::QuicStringPiece;
+ using quic::QuicTextUtils;
+ using quic::QuicUrl;
+ 
+ }  // namespace
+ 
++
+ DEFINE_QUIC_COMMAND_LINE_FLAG(
+     std::string,
+     host,
+@@ -172,6 +188,160 @@ namespace quic {
+ QuicToyClient::QuicToyClient(ClientFactory* client_factory)
+     : client_factory_(client_factory) {}
+ 
++std::string QuicToyClient::getInterfaceName() 
++{ 
++  struct ifaddrs *ifa;
++  struct ifaddrs *ifaOrig;
++  char interfaceName[32] = "host-eth0";
++  char lo[8] = "lo";
++  
++  // get interfaces
++  int ret = getifaddrs(&ifa);
++  if (ret != 0) {
++    perror("Error getting interfaces");
++  } 
++  else {
++    ifaOrig = ifa;
++    // keep going until the last element in the interfaces array
++    while (ifa != NULL) {
++      std::cout << ifa->ifa_name << std::endl;
++
++      if (strcmp(ifa->ifa_name, lo) != 0) {
++        strcpy(interfaceName, ifa->ifa_name);
++        break;
++      }
++
++      ifa = ifa->ifa_next;
++    }
++
++    freeifaddrs(ifaOrig);
++  }
++
++  std::string s(interfaceName);
++  return s;
++}
++
++void QuicToyClient::getNewIPv4(std::string interfaceName, std::string dhcpAddress, struct in_addr *oldIp)
++{
++  std::cout << "\nGetting new IP address..." << std::endl;
++  dhcp::DHCPClient dhcpClient(interfaceName.c_str(), dhcpAddress.c_str());
++  while (1) {
++    struct in_addr newIp;
++    dhcp::lease l;
++
++    dhcpClient.initialize();
++
++    // do first discover
++    std::cout << "\nSending DHCP Discover request to " << dhcpAddress << "...";
++    dhcpClient.do_discover();
++    dhcpClient.listen_offer();
++
++    bool acknowledged = false;
++    auto offer = dhcpClient.get_offer();
++    struct in_addr server_ip = {};
++    for (auto option : dhcp::parse_dhcp_packet(&offer)) {
++      if (option.type == DHO_DHCP_SERVER_IDENTIFIER) {
++        memcpy((void *) &server_ip, option.data, option.length);
++      }
++    }
++    std::cout << "\nReceived offer from " << dhcp::inAddrToString(server_ip) << "...";
++
++    // confirm that can use this IP
++    dhcpClient.do_request(server_ip, offer.yiaddr);
++    std::cout << "\nSent Request to " << dhcp::inAddrToString(server_ip) << "...";
++    int res = dhcpClient.listen_acknowledgement(server_ip);
++    std::cout << "\nGet response from " << dhcp::inAddrToString(server_ip) << "...";
++
++    if (res != 0) {
++      std::cout << "\nReturn val of listen is non-zero...";
++      dhcpClient.cleanup();
++      continue;
++    }
++
++    auto ack_packet = dhcpClient.get_acknowledge();
++    for (auto option : dhcp::parse_dhcp_packet(&ack_packet)) {
++      if (option.type == DHO_DHCP_MESSAGE_TYPE) {
++        if (*option.data == DHCPACK) {
++          l = dhcp::process_lease(&ack_packet);
++          acknowledged = true;
++        } else if (*option.data == DHCPNAK) {
++          l = dhcp::process_lease(&ack_packet);
++          // break;
++        }
++      }
++    }
++
++    dhcpClient.cleanup();
++
++    // if haven't received acknowledgement, try again
++    if (!acknowledged) {
++      std::cout << "\nNot acknowledged from " << dhcp::inAddrToString(server_ip) << "...";
++      continue;
++    }
++
++    newIp = l.address;
++    std::string netmask = "255.255.255.0";
++
++    if (oldIp == 0) {
++      // call setIpv4
++      setIPv4(interfaceName, dhcp::inAddrToString(l.address), dhcp::inAddrToString(l.routers), netmask);
++      break;
++    }
++    
++    // if no old IP address, set IP and break
++    if (oldIp->s_addr == 0) {
++      // call setIpv4
++      setIPv4(interfaceName, dhcp::inAddrToString(l.address), dhcp::inAddrToString(l.routers), netmask);
++      oldIp->s_addr = newIp.s_addr;
++      break;
++    }
++
++    // If new IP is different from old IP, set IP and break
++    if (oldIp->s_addr != newIp.s_addr) {
++      // call setIpv4
++      setIPv4(interfaceName, dhcp::inAddrToString(l.address), dhcp::inAddrToString(l.routers), netmask);
++      oldIp->s_addr = newIp.s_addr;
++      break;
++    }
++    
++    std::cout << "\nNew IP address " << dhcp::inAddrToString(newIp) << " is same as old...\n";
++  }
++
++  return;
++}
++
++void QuicToyClient::setIPv4(std::string interfaceName, std::string ip0, std::string gw0, std::string netmask0)
++{
++	char cmd[256];
++	//network interface
++	const char * nwkInf = interfaceName.c_str();
++  const char * ip = ip0.c_str();
++  // const char * gw = gw0.c_str();
++  const char * netmask = netmask0.c_str();
++
++	//link down command in Linux
++	sprintf(cmd,"ip link set %s down",nwkInf);
++	system(cmd); 
++	
++	
++	memset(cmd,0x00,128);
++	//command to set ip address, netmask
++	sprintf(cmd,"ifconfig %s %s netmask %s",nwkInf,ip,netmask);
++	system(cmd);	 
++	printf("\ncmd : %s\n",cmd); fflush(stdout);
++	memset(cmd,0X00,128);
++
++	//command to set gateway
++	// sprintf(cmd,"route add default gw %s %s",gw,nwkInf);
++	// system(cmd); 
++
++	memset(cmd,0X00,128);
++	//link up command
++	sprintf(cmd,"ip link set %s up",nwkInf);
++	system(cmd); 
++	
++}
++
+ int QuicToyClient::SendRequestsAndPrintResponses(
+     std::vector<std::string> urls) {
+   QuicUrl url(urls[0], "https");
+@@ -284,7 +454,17 @@ int QuicToyClient::SendRequestsAndPrintResponses(
+   // Make sure to store the response, for later output.
+   client->set_store_response(true);
+ 
++  // std::string ip1 = "10.0.1.15";
++  // std::string ip2 = "10.0.1.16";
++  // std::string gw = "192.168.10.1";
++  // std::string nmask = "255.0.0.0";
++  std::string dhcpAddress = "10.0.1.200";
++  std::string interfaceName = getInterfaceName();
++  struct in_addr ipAddr;
++  memset(&ipAddr, 0x00, sizeof(struct in_addr));
+   for (int i = 0; i < num_requests; ++i) {
++    std::cout << "Starting request number " << i << std::endl;
++    std::cout << "----------------------------" << std::endl;
+     // Send the request.
+     client->SendRequestAndWaitForResponse(header_block, body, /*fin=*/true);
+ 
+@@ -313,6 +493,9 @@ int QuicToyClient::SendRequestsAndPrintResponses(
+       std::cout << "headers: " << client->latest_response_headers()
+                 << std::endl;
+       std::string response_body = client->latest_response_body();
++      if (QUIC_TOY_CLIENT_MAX_BODY_CHARS > 0 && response_body.length() > QUIC_TOY_CLIENT_MAX_BODY_CHARS)
++        response_body = response_body.substr(0, QUIC_TOY_CLIENT_MAX_BODY_CHARS) 
++          + "\n-------- Some content truncated for printing --------\n";
+       if (!GetQuicFlag(FLAGS_body_hex).empty()) {
+         // Assume response is binary data.
+         std::cout << "body:\n"
+@@ -350,6 +533,12 @@ int QuicToyClient::SendRequestsAndPrintResponses(
+ 
+     // Change the ephemeral port if there are more requests to do.
+     if (!GetQuicFlag(FLAGS_disable_port_changes) && i + 1 < num_requests) {
++
++      std::cout << "Sleeping for about two seconds before next request..." << std::endl << std::endl;
++      std::this_thread::sleep_for(std::chrono::milliseconds(2200));
++
++      getNewIPv4(interfaceName, dhcpAddress, &ipAddr);
++
+       if (!client->ChangeEphemeralPort()) {
+         std::cerr << "Failed to change ephemeral port." << std::endl;
+         return 1;
+diff --git a/quic/tools/quic_toy_client.h b/quic/tools/quic_toy_client.h
+index 1a201225..996cdc47 100644
+--- a/quic/tools/quic_toy_client.h
++++ b/quic/tools/quic_toy_client.h
+@@ -40,6 +40,21 @@ class QuicToyClient {
+ 
+  private:
+   ClientFactory* client_factory_;  // Unowned.
++
++  // get the name of the interface (that isn't lo)
++  std::string getInterfaceName();
++
++  // Sets the IP address 
++  void setIPv4(std::string interfaceName, std::string ip0, std::string gw0, std::string netmask0);
++  
++  // oldIp should be provided to ensure that new IP address is new
++  // if oldIP is null, just use the first provided IP address
++  // if the contents of oldIP is 0.0.0.0, use first provided IP
++  // if oldIp not null, updates the oldIp struct to hold the new IP address
++  void getNewIPv4(std::string interface_name, std::string dhcpAddress, struct in_addr *oldIp);
++
++  struct in_addr stringToInAddr(std::string addrString);
++  std::string inAddrToString(struct in_addr iAddr);
+ };
+ 
+ }  // namespace quic
